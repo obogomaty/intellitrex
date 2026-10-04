@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
 import { SUPPORTED_COINS, MODELS } from "@/lib/constants";
 import { TrendingUp, TrendingDown, Activity } from "lucide-react";
 import { useAuth } from "@/lib/auth-context";
@@ -28,6 +28,44 @@ type Metrics = Record<
   string,
   { MAE?: number; RMSE?: number; R2?: number; [key: string]: number | undefined }
 >;
+
+type LoadStatus = "loading" | "success" | "empty" | "error";
+
+function DataNotice({ status, error, onRetry, emptyMessage }: {
+  status: LoadStatus;
+  error: string;
+  onRetry: () => void;
+  emptyMessage: string;
+}) {
+  if (status === "loading") {
+    return <p role="status" className="text-sm text-muted-foreground">Loading data...</p>;
+  }
+  if (status === "error") {
+    return (
+      <div role="alert" className="flex flex-wrap items-center gap-3 text-sm text-danger">
+        <span>{error}</span>
+        <button onClick={onRetry} className="text-primary hover:underline">Retry</button>
+      </div>
+    );
+  }
+  if (status === "empty") {
+    return <p className="text-sm text-muted-foreground">{emptyMessage}</p>;
+  }
+  return null;
+}
+
+function isFearGreedEntry(value: unknown): value is { value: number; classification: string } {
+  return typeof value === "object" && value !== null && "value" in value &&
+    typeof value.value === "number" && Number.isFinite(value.value) &&
+    "classification" in value && typeof value.classification === "string";
+}
+
+function isFearGreedPayload(value: unknown): value is FearGreed {
+  if (typeof value !== "object" || value === null) return false;
+  const payload = value as Record<string, unknown>;
+  return ["current", "yesterday", "lastWeek", "lastMonth"].every((key) =>
+    isFearGreedEntry(payload[key]));
+}
 
 const TIME_RANGES = [
   { label: "24H", interval: "60", limit: 24 },
@@ -143,45 +181,99 @@ export default function CurrencyPage() {
   const [showSMA, setShowSMA] = useState(false);
   const [showRSI, setShowRSI] = useState(false);
   const [showBollinger, setShowBollinger] = useState(false);
-  const [loading, setLoading] = useState(true);
+  const [pricesStatus, setPricesStatus] = useState<LoadStatus>("loading");
+  const [pricesError, setPricesError] = useState("");
+  const [forecastsStatus, setForecastsStatus] = useState<LoadStatus>("loading");
+  const [forecastsError, setForecastsError] = useState("");
+  const [fearGreedStatus, setFearGreedStatus] = useState<LoadStatus>("loading");
+  const [fearGreedError, setFearGreedError] = useState("");
+  const requestIds = useRef({ prices: 0, forecasts: 0, fearGreed: 0 });
 
   const fetchPrices = useCallback(async () => {
-    setLoading(true);
+    const requestId = ++requestIds.current.prices;
+    setPricesStatus("loading");
+    setPricesError("");
+    setCandles([]);
     try {
       const res = await fetch(
         `/api/prices?pair=${selectedCoin.krakenPair}&interval=${timeRange.interval}&limit=${timeRange.limit}`
       );
-      const data = await res.json();
-      if (data.candles) {
-        const sliced = data.candles.slice(-timeRange.limit);
-        setCandles(sliced);
+      const data: unknown = await res.json();
+      if (!res.ok) {
+        throw new Error(typeof data === "object" && data !== null && "error" in data && typeof data.error === "string"
+          ? data.error : "Unable to load prices.");
       }
-    } catch (e) {
-      console.error("Failed to fetch prices", e);
+      if (typeof data !== "object" || data === null || !("candles" in data) || !Array.isArray(data.candles) ||
+        !data.candles.every((c) => typeof c === "object" && c !== null &&
+          ["time", "open", "high", "low", "close", "volume"].every((key) =>
+            key in c && typeof c[key] === "number" && Number.isFinite(c[key])))) {
+        throw new Error("Price service returned invalid data.");
+      }
+      if (requestId !== requestIds.current.prices) return;
+      const nextCandles = data.candles.slice(-timeRange.limit) as Candle[];
+      setCandles(nextCandles);
+      setPricesStatus(nextCandles.length ? "success" : "empty");
+    } catch (error) {
+      if (requestId !== requestIds.current.prices) return;
+      setPricesError(error instanceof Error ? error.message : "Unable to load prices.");
+      setPricesStatus("error");
     }
-    setLoading(false);
   }, [selectedCoin, timeRange]);
 
   const fetchForecasts = useCallback(async () => {
+    const requestId = ++requestIds.current.forecasts;
+    setForecastsStatus("loading");
+    setForecastsError("");
+    setForecasts([]);
+    setMetrics(null);
     try {
       const res = await fetch(
         `/api/forecasts?pair=${selectedCoin.pair}&model=${selectedModel}`
       );
-      const data = await res.json();
-      setForecasts(data.forecasts || []);
-      setMetrics(data.metrics || null);
-    } catch (e) {
-      console.error("Failed to fetch forecasts", e);
+      const data: unknown = await res.json();
+      if (!res.ok) {
+        throw new Error(typeof data === "object" && data !== null && "error" in data && typeof data.error === "string"
+          ? data.error : "Unable to load forecasts.");
+      }
+      if (typeof data !== "object" || data === null || !("forecasts" in data) || !Array.isArray(data.forecasts) ||
+        !data.forecasts.every((row) => typeof row === "object" && row !== null && !Array.isArray(row))) {
+        throw new Error("Forecast service returned invalid data.");
+      }
+      if (requestId !== requestIds.current.forecasts) return;
+      const nextForecasts = data.forecasts as ForecastRow[];
+      setForecasts(nextForecasts);
+      setMetrics("metrics" in data && typeof data.metrics === "object" && data.metrics !== null && !Array.isArray(data.metrics)
+        ? data.metrics as Metrics : null);
+      setForecastsStatus(nextForecasts.length ? "success" : "empty");
+    } catch (error) {
+      if (requestId !== requestIds.current.forecasts) return;
+      setForecastsError(error instanceof Error ? error.message : "Unable to load forecasts.");
+      setForecastsStatus("error");
     }
   }, [selectedCoin, selectedModel]);
 
   const fetchFearGreedData = useCallback(async () => {
+    const requestId = ++requestIds.current.fearGreed;
+    setFearGreedStatus("loading");
+    setFearGreedError("");
+    setFearGreed(null);
     try {
       const res = await fetch("/api/fear-greed");
-      const data = await res.json();
-      setFearGreed(data);
-    } catch (e) {
-      console.error("Failed to fetch fear & greed", e);
+      const data: unknown = await res.json();
+      if (!res.ok) {
+        throw new Error(typeof data === "object" && data !== null && "error" in data && typeof data.error === "string"
+          ? data.error : "Unable to load Fear & Greed data.");
+      }
+      if (!isFearGreedPayload(data)) {
+        throw new Error("Fear & Greed service returned invalid data.");
+      }
+      if (requestId !== requestIds.current.fearGreed) return;
+      setFearGreed(data as FearGreed);
+      setFearGreedStatus("success");
+    } catch (error) {
+      if (requestId !== requestIds.current.fearGreed) return;
+      setFearGreedError(error instanceof Error ? error.message : "Unable to load Fear & Greed data.");
+      setFearGreedStatus("error");
     }
   }, []);
 
@@ -357,9 +449,14 @@ export default function CurrencyPage() {
 
               {/* SVG Chart */}
               <div className="relative w-full bg-muted/30 rounded-xl overflow-hidden" style={{ aspectRatio: `${svgW}/${svgH}` }}>
-                {loading ? (
+                {pricesStatus === "loading" ? (
                   <div className="absolute inset-0 flex items-center justify-center">
                     <Activity className="w-8 h-8 text-muted-foreground animate-pulse" />
+                  </div>
+                ) : pricesStatus === "error" || pricesStatus === "empty" ? (
+                  <div className="absolute inset-0 flex items-center justify-center p-4 text-center">
+                    <DataNotice status={pricesStatus} error={pricesError} onRetry={fetchPrices}
+                      emptyMessage="No price data is available for this selection." />
                   </div>
                 ) : (
                   <svg
@@ -678,17 +775,17 @@ export default function CurrencyPage() {
                 <div
                   className={cn(
                     "rounded-xl p-4 text-center",
-                    priceChange >= 0 ? "bg-success/10" : "bg-danger/10"
+                    !latestCandle ? "bg-muted" : priceChange >= 0 ? "bg-success/10" : "bg-danger/10"
                   )}
                 >
                   <p
                     className={cn(
                       "text-xl font-bold",
-                      priceChange >= 0 ? "text-success" : "text-danger"
+                      !latestCandle ? "text-muted-foreground" : priceChange >= 0 ? "text-success" : "text-danger"
                     )}
                   >
-                    {priceChange.toFixed(2)}%{" "}
-                    {priceChange >= 0 ? (
+                    {latestCandle ? `${priceChange.toFixed(2)}%` : "--"}{" "}
+                    {!latestCandle ? null : priceChange >= 0 ? (
                       <TrendingUp className="w-4 h-4 inline" />
                     ) : (
                       <TrendingDown className="w-4 h-4 inline" />
@@ -698,13 +795,13 @@ export default function CurrencyPage() {
                 </div>
                 <div className="rounded-xl border border-border p-4 text-center">
                   <p className="text-lg font-semibold text-foreground">
-                    {formatPrice(highOfDay)}
+                    {latestCandle ? formatPrice(highOfDay) : "--"}
                   </p>
                   <p className="text-xs text-muted-foreground mt-1">Highest</p>
                 </div>
                 <div className="rounded-xl border border-border p-4 text-center">
                   <p className="text-lg font-semibold text-foreground">
-                    {formatPrice(lowOfDay)}
+                    {latestCandle ? formatPrice(lowOfDay) : "--"}
                   </p>
                   <p className="text-xs text-muted-foreground mt-1">Lowest</p>
                 </div>
@@ -712,12 +809,15 @@ export default function CurrencyPage() {
             </div>
 
             {/* 7-Day Forecast */}
-            {forecasts.length > 0 && (
+            {forecastsStatus !== "success" || forecasts.length > 0 ? (
               <div className="bg-card rounded-2xl p-6 border border-border">
                 <h3 className="font-semibold text-foreground mb-4">
                   7-Day Forecast ({selectedModel})
                 </h3>
-                <div className="space-y-2">
+                {forecastsStatus !== "success" ? (
+                  <DataNotice status={forecastsStatus} error={forecastsError} onRetry={fetchForecasts}
+                    emptyMessage="No forecast data is available for this pair and model." />
+                ) : <div className="space-y-2">
                   {forecasts.map((f, i) => {
                     const price = parseFloat(
                       f.Close || f.Predicted_Close || f.Forecast || "0"
@@ -736,22 +836,25 @@ export default function CurrencyPage() {
                       </div>
                     );
                   })}
-                </div>
+                </div>}
               </div>
-            )}
+            ) : null}
 
             {/* Fear & Greed */}
-            {fearGreed && (
-              <div className="bg-card rounded-2xl p-6 border border-border">
-                <h3 className="font-semibold text-foreground mb-4">Fear and Greed Index</h3>
+            <div className="bg-card rounded-2xl p-6 border border-border">
+              <h3 className="font-semibold text-foreground mb-4">Fear and Greed Index</h3>
+              {fearGreedStatus !== "success" || !fearGreed ? (
+                <DataNotice status={fearGreedStatus} error={fearGreedError} onRetry={fetchFearGreedData}
+                  emptyMessage="Fear & Greed data is not available." />
+              ) : (
                 <div className="grid grid-cols-2 gap-3">
                   <FearGreedGauge value={fearGreed.current.value} label="Now" />
                   <FearGreedGauge value={fearGreed.yesterday.value} label="Yesterday" />
                   <FearGreedGauge value={fearGreed.lastWeek.value} label="Last Week" />
                   <FearGreedGauge value={fearGreed.lastMonth.value} label="Last Month" />
                 </div>
-              </div>
-            )}
+              )}
+            </div>
           </div>
         </div>
       </div>
